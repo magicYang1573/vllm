@@ -9,6 +9,7 @@ from typing_extensions import Self
 from vllm.config.utils import config, get_hash_factors, hash_factors
 
 if TYPE_CHECKING:
+    from vllm.config.load import LoadConfig
     from vllm.config.model import ModelConfig
     from vllm.config.parallel import ParallelConfig
 
@@ -55,6 +56,12 @@ class EngramConfig:
     effort, falls back to ordinary pinned pages). Prefaulting the tables at
     startup takes longer. Requires cpu_offload without dp_shared_memory."""
 
+    mooncake_store: bool = False
+    """Use global Mooncake tables configured by MOONCAKE_* variables.
+    Set VLLM_ENGRAM_MOONCAKE_PUBLISH=1 on one instance per tenant; its rank 0
+    owns the CPU segment and must stay alive. Overrides cpu_offload and
+    cannot be combined with dp_shared_memory or use_thp."""
+
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
         if self.dp_shared_memory and not self.cpu_offload:
@@ -63,6 +70,12 @@ class EngramConfig:
             raise ValueError(
                 "use_thp requires cpu_offload=True and dp_shared_memory=False"
             )
+        if self.dp_shared_memory and self.mooncake_store:
+            raise ValueError(
+                "dp_shared_memory and Mooncake are alternative Engram placements"
+            )
+        if self.use_thp and self.mooncake_store:
+            raise ValueError("use_thp only applies to local Engram tables")
         return self
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
@@ -82,12 +95,21 @@ class EngramConfig:
                 "embeddings and non-empty n-gram layer ids."
             )
 
+        if self.mooncake_store:
+            from vllm.platforms import current_platform
+
+            if model_config.architecture != "DeepseekV41ForCausalLM":
+                raise ValueError("Mooncake Engram only supports DeepSeek V4.1")
+            if not current_platform.is_cuda():
+                raise ValueError("Mooncake Engram requires CUDA")
+
     def resolve_dp_shared_memory(self, parallel_config: "ParallelConfig") -> None:
         """Share host tables by default wherever the configuration permits."""
         if self.dp_shared_memory is None:
             self.dp_shared_memory = (
                 self.cpu_offload
                 and not self.use_thp
+                and not self.mooncake_store
                 and parallel_config.data_parallel_size > 1
                 and not parallel_config.enable_elastic_ep
             )
@@ -107,6 +129,23 @@ class EngramConfig:
             raise ValueError(
                 "Engram embedding_across_dp is not supported with elastic EP yet."
             )
+
+    def verify_load_config(self, load_config: "LoadConfig") -> None:
+        """Keep remote tables out of local checkpoint materialization."""
+        if self.mooncake_store:
+            if load_config.load_format not in ("safetensors", "dummy"):
+                raise ValueError(
+                    "mooncake_store requires load_format 'safetensors' "
+                    f"or 'dummy'; got {load_config.load_format!r}."
+                )
+            if (
+                load_config.load_format == "safetensors"
+                and load_config.safetensors_load_strategy != "lazy"
+            ):
+                raise ValueError(
+                    "mooncake_store requires safetensors_load_strategy='lazy' "
+                    "to avoid materializing external tables in local memory."
+                )
 
     def get_parallel_size(self, parallel_config: "ParallelConfig") -> int:
         """Derive the embedding group size from the parallel configuration."""

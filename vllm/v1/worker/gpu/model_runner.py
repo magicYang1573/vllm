@@ -1348,7 +1348,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_tokens_after_padding = max(num_tokens, batch_desc.num_tokens)
         assert num_tokens > 0
         is_padding = self.input_buffers.is_padding[:num_tokens_after_padding]
-        if envs.VLLM_MOE_SKIP_PADDING:
+        if envs.VLLM_MOE_SKIP_PADDING or (
+            self.vllm_config.engram_config
+            and self.vllm_config.engram_config.mooncake_store
+        ):
+            # Refresh masks after dummy forwards even when MoE skips no padding.
             is_padding[:num_tokens].fill_(False)
             is_padding[num_tokens:].fill_(True)
 

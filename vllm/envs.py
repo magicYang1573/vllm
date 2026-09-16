@@ -306,6 +306,7 @@ if TYPE_CHECKING:
     VLLM_USE_V2_MODEL_RUNNER: bool | None = None
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
+    VLLM_ENGRAM_MOONCAKE_PUBLISH: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_KV_OFFLOAD_MAX_BATCH_DESCRIPTORS: int = 0
@@ -2129,6 +2130,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_MFU_METRICS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MFU_METRICS", "0"))
     ),
+    # Let one instance initialize and own the global Engram tables.
+    "VLLM_ENGRAM_MOONCAKE_PUBLISH": lambda: bool(
+        int(os.getenv("VLLM_ENGRAM_MOONCAKE_PUBLISH", "0"))
+    ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
         int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))
@@ -2368,6 +2373,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR",
         "VLLM_FLASHINFER_AUTOTUNE_SKIP_OPS",
+        "VLLM_ENGRAM_MOONCAKE_PUBLISH",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
         "VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS",
         "VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS",

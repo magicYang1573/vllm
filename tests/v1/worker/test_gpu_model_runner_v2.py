@@ -22,6 +22,36 @@ from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.model_runner import ExecuteModelState, GPUModelRunner
 
 
+@pytest.mark.parametrize("skip_moe_padding", [False, True])
+def test_store_refreshes_padding_after_dummy_batch(monkeypatch, skip_moe_padding):
+    """A dummy forward must not leave real Store requests marked as padding."""
+    from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        engram_config=SimpleNamespace(mooncake_store=True)
+    )
+    runner.input_buffers = InputBuffers(2, 8, torch.device("cpu"))
+    InputBatch.make_dummy(1, 8, runner.input_buffers)
+    monkeypatch.setattr(
+        model_runner_module.envs, "VLLM_MOE_SKIP_PADDING", skip_moe_padding
+    )
+
+    class MaskPrepared(Exception):
+        pass
+
+    class Batch:
+        num_tokens = 3
+
+        @property
+        def req_ids(self):
+            raise MaskPrepared
+
+    with pytest.raises(MaskPrepared):
+        runner.prepare_inputs(None, Batch(), SimpleNamespace(num_tokens=8), 0)
+    assert runner.input_buffers.is_padding.tolist() == [False] * 3 + [True] * 5
+
+
 def test_non_last_pp_rank_uses_global_batch_for_sample_feedback():
     runner = GPUModelRunner.__new__(GPUModelRunner)
     runner.is_last_pp_rank = False

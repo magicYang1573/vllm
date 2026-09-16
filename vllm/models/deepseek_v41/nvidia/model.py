@@ -106,6 +106,7 @@ from ..common.engram import (
     gather_engram_hashes,
 )
 from ..common.mm_preprocess import IMAGE_SENTINEL_BASE_ID, image_sentinel_mask
+from .engram_mooncake import EngramMooncake, init_mooncake_engram
 from .ops.mhc import (
     MHC_OVERLAP_MAX_TOKENS,
     init_mhc_all_reduce,
@@ -305,7 +306,13 @@ class DeepseekV4DecoderLayer(nn.Module):
         if engram_layout is not None:
             layer_id = extract_layer_index(prefix)
             if layer_id in engram_layout.layer_ids:
-                self.engram = Engram(
+                engram_cls = (
+                    EngramMooncake
+                    if vllm_config.engram_config
+                    and vllm_config.engram_config.mooncake_store
+                    else Engram
+                )
+                self.engram = engram_cls(
                     config,
                     vllm_config.quant_config,
                     engram_layout,
@@ -817,6 +824,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 )
                 self.engram_swa_prefix = swa_cache_module.prefix
 
+        self.engram_mooncake = bool(
+            vllm_config.engram_config and vllm_config.engram_config.mooncake_store
+        )
+        if self.engram_mooncake:
+            init_mooncake_engram(self, vllm_config)
+
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
         else:
@@ -908,6 +921,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 # takes True=dead) and their gate is zeroed (Engram.forward
                 # takes True=keep).
                 image_mask = image_sentinel_mask(input_ids)
+                if self.engram_mooncake:
+                    is_padding = get_forward_context().is_padding
+                    if is_padding is not None:
+                        # Idle DP ranks join EP collectives without Store reads.
+                        image_mask = image_mask | is_padding
                 engram_mask = ~image_mask
                 if lookback_token_ids is None:
                     if not self.engram_hash.use_slot_cache:
@@ -929,6 +947,11 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     swa_metadata.slot_mapping,
                     swa_metadata.block_table,
                 )
+                if self.engram_mooncake:
+                    # Dead tokens still hash to valid pad rows; suppress their reads.
+                    engram_hashes = engram_hashes.masked_fill(
+                        image_mask[:, None, None], -1
+                    )
             elif not self.engram_dp_shared_memory and get_engram_dp_size() > 1:
                 # DP-sharded lookups are collective, so a replica skipping the
                 # hash still has to reach them.

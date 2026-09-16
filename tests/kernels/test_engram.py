@@ -16,6 +16,198 @@ from vllm.models.deepseek_v41.common.engram import (
 from vllm.platforms import current_platform
 
 
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA required")
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_mooncake_embedding_shards_heads_only_across_tp(monkeypatch, tp_rank):
+    """The shared upstream embedding must not reintroduce DP head sharding."""
+    from vllm.models.deepseek_v41.nvidia import engram_mooncake as ops
+
+    monkeypatch.setattr(engram_ops, "get_engram_dp_size", lambda: 8)
+    monkeypatch.setattr(engram_ops, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(ops, "get_tensor_model_parallel_rank", lambda: tp_rank)
+    layout = SimpleNamespace(
+        num_embeddings=(60,), head_dim=32, primes=(((11, 13), (17, 19)),)
+    )
+    embedding = ops.MooncakeEngramEmbedding(layout, 0)
+    assert embedding.dp_size == 1
+    assert embedding.tp_size == 2 and embedding.part_n_hash_cols == 2
+    assert embedding.head_start == tp_rank * 2
+    assert embedding.vocab_start_idx == (0 if tp_rank == 0 else 24)
+    assert embedding.weight.numel() == embedding.weight_scale_inv.numel() == 0
+
+
+@pytest.mark.parametrize("tokens", [1, 257, 2048])
+def test_mooncake_prefetch_preserves_rank_local_gpu_ids(monkeypatch, tokens):
+    """Forward only owned heads, preserve padding, and defer completion to use."""
+    from pathlib import Path
+
+    from vllm.models.deepseek_v41.nvidia import engram_mooncake as ops
+
+    monkeypatch.setattr(ops.MooncakeEngramBackend, "_connect", lambda self: None)
+    monkeypatch.setattr(ops, "dbo_current_ubatch_id", lambda: 0)
+    event = SimpleNamespace(record=lambda *args: None)
+    stream = SimpleNamespace(cuda_stream=17, wait_event=lambda event: None)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: stream)
+    monkeypatch.setattr(torch.cuda, "Event", lambda **kwargs: event)
+    manifest = dict(version=3, publication="test", model=str(Path(".").resolve()))
+    for rank in range(8):
+        ids = torch.tensor(
+            [[rank, rank + 1, rank + 12, rank + 20]], dtype=torch.int32
+        ).repeat(tokens + 3, 1)
+        ids[tokens:] = -1
+        if rank:
+            ids.fill_(-1)
+        allocation = torch.empty((2, tokens + 20, 4), dtype=torch.uint8)
+        buffer = SimpleNamespace(packed=allocation, rows=torch.empty(tokens + 20, 2, 4))
+        backend = ops.MooncakeEngramBackend(manifest, 1, ".")
+        backend._layer = SimpleNamespace(
+            head_start=1,
+            head_sizes=[32, 32],
+            store_ids=(2, 3),
+            offsets=(0, 10),
+            buffers=[buffer],
+        )
+        calls: list[tuple] = []
+        waits: list[int] = []
+
+        def read(heads, rows, output, *, stream, offsets, calls=calls, waits=waits):
+            calls.append((heads, rows, output, stream, offsets))
+            return SimpleNamespace(wait=waits.append)
+
+        backend._table = SimpleNamespace(lookup=read)
+        try:
+            backend.prefetch(ids)
+            assert len(calls) == 1
+            heads, rows, output, submitted_stream, offsets = calls[0]
+            assert rows.data_ptr() == ids[:, 1:3].data_ptr()
+            torch.testing.assert_close(rows, ids[:, 1:3])
+            assert heads == (2, 3) and offsets == (0, 10)
+            assert output.is_contiguous() and output.shape == (2, tokens + 3, 4)
+            assert submitted_stream == 17 and not waits
+            backend.wait()
+            assert waits == [17]
+        finally:
+            backend.close()
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="CUDA Graph regression")
+def test_mooncake_capture_after_warmup_on_another_stream(monkeypatch):
+    """Buffer reuse events must not import uncaptured work into a graph."""
+    from pathlib import Path
+
+    from vllm.models.deepseek_v41.nvidia import engram_mooncake as ops
+
+    monkeypatch.setattr(ops, "dbo_current_ubatch_id", lambda: 0)
+    monkeypatch.setattr(ops.MooncakeEngramBackend, "_connect", lambda self: None)
+    manifest = dict(version=3, publication="test", model=str(Path(".").resolve()))
+    backend = ops.MooncakeEngramBackend(manifest, 1, ".")
+    buffer = ops._LayerBuffers(
+        torch.empty((2, 16, 264), dtype=torch.uint8, device="cuda"),
+        torch.empty((16, 2, 256), dtype=torch.bfloat16, device="cuda"),
+    )
+    backend._layer = SimpleNamespace(
+        head_start=0,
+        head_sizes=[17, 17],
+        store_ids=(1, 2),
+        offsets=(0, 17),
+        block_size=32,
+        buffers=[buffer],
+    )
+
+    def read(heads, ids, output, **kwargs):
+        output.zero_()
+        return SimpleNamespace(wait=lambda stream: None)
+
+    backend._table = SimpleNamespace(lookup=read)
+    ids = torch.tensor([[0, 17], [-1, -1]], dtype=torch.int32, device="cuda")
+    graph = None
+    try:
+        backend.prefetch(ids)
+        backend.rows()
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            backend.prefetch(ids)
+            output = backend.rows()
+        for _ in range(3):
+            graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(output, torch.zeros_like(output))
+    finally:
+        del graph
+        backend.close()
+
+
+@pytest.mark.parametrize("store", [False, True])
+@pytest.mark.parametrize("padding", [[True] * 4, [False, True, False, True]])
+def test_mooncake_model_prefetch_masks_padding(monkeypatch, store, padding):
+    """Exercise the model hook: hasher dead masks alone still produce pad hashes."""
+    from vllm.models.deepseek_v41.nvidia import model as model_ops
+
+    class Prepared(Exception):
+        pass
+
+    class Hash:
+        def ensure_cache(self):
+            return True
+
+        def __call__(self, ids, positions, starts, dead, *args):
+            # Real hasher output is also a legal hash on dead tokens.
+            self.dead = dead
+            return ids[:, None, None].expand(-1, 1, 2).clone()
+
+    hashes = Hash()
+    received = []
+
+    def prepare(ids):
+        received.append(ids)
+        raise Prepared
+
+    metadata = SimpleNamespace(
+        query_start_loc=None, slot_mapping=None, block_table=None
+    )
+    context = SimpleNamespace(
+        attn_metadata={"swa": metadata}, is_padding=torch.tensor(padding)
+    )
+    monkeypatch.setattr(model_ops, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(model_ops, "get_forward_context", lambda: context)
+    monkeypatch.setattr(
+        model_ops, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True)
+    )
+    monkeypatch.setattr(model_ops, "gather_engram_hashes", lambda ids, **kw: ids)
+    model = SimpleNamespace(
+        use_native_mega_moe=False,
+        engram_hash=hashes,
+        engram_swa_prefix="swa",
+        engram_mooncake=store,
+        engram_dp_shared_memory=True,
+        layers=[
+            SimpleNamespace(
+                engram=SimpleNamespace(layer_hash_index=0, prepare_embeddings=prepare)
+            )
+        ],
+        start_layer=0,
+        end_layer=1,
+    )
+    ids = torch.arange(4)
+    with pytest.raises(Prepared):
+        model_ops.DeepseekV4Model.forward(
+            model,
+            ids,
+            ids,
+            None,
+            inputs_embeds=torch.zeros(4, 1),
+            lookback_token_ids=torch.zeros(1, 3, dtype=torch.int64),
+        )
+    expected = ids[:, None].expand(-1, 2).clone()
+    if store:
+        expected[context.is_padding] = -1
+    torch.testing.assert_close(received[0], expected)
+    torch.testing.assert_close(
+        hashes.dead, context.is_padding if store else torch.zeros(4, dtype=torch.bool)
+    )
+
+
 def _reference_engram_post_wkv(
     hidden_states,
     kv,

@@ -1693,6 +1693,31 @@ def test_engram_thp_rejects_explicit_shared_memory():
 
 
 @pytest.mark.parametrize(
+    "load_format,strategy,error",
+    [
+        ("safetensors", "lazy", None),
+        ("dummy", None, None),
+        ("pt", None, "requires load_format"),
+        ("safetensors", None, "requires.*lazy"),
+        ("safetensors", "eager", "requires.*lazy"),
+    ],
+)
+def test_engram_mooncake_load_config(load_format, strategy, error):
+    config = EngramConfig(cpu_offload=False, mooncake_store=True)
+    load = LoadConfig(load_format=load_format, safetensors_load_strategy=strategy)
+    if error:
+        with pytest.raises(ValueError, match=error):
+            config.verify_load_config(load)
+    else:
+        config.verify_load_config(load)
+
+
+def test_engram_mooncake_rejects_shared_memory():
+    with pytest.raises(ValueError, match="alternative Engram placements"):
+        EngramConfig(dp_shared_memory=True, mooncake_store=True)
+
+
+@pytest.mark.parametrize(
     "dp_size,load_format,multithread,error",
     [
         (1, "auto", False, "requires data_parallel_size > 1"),
@@ -4218,3 +4243,36 @@ def test_hybrid_layer_counts_sparse_attention_as_attention(
             )
             == len(layer_types) - expected_attention
         )
+
+
+@pytest.mark.parametrize("cpu_offload", [False, True])
+def test_engram_mooncake_does_not_default_to_local_shared_tables(cpu_offload):
+    config = EngramConfig(cpu_offload=cpu_offload, mooncake_store=True)
+    config.resolve_dp_shared_memory(
+        SimpleNamespace(data_parallel_size=8, enable_elastic_ep=False)
+    )
+    assert config.dp_shared_memory is False
+
+
+def test_engram_mooncake_rejects_local_huge_pages():
+    with pytest.raises(ValueError, match="only applies to local"):
+        EngramConfig(mooncake_store=True, use_thp=True)
+
+
+def test_engram_mooncake_load_validation_runs_during_config_resolution(monkeypatch):
+    config = VllmConfig.__new__(VllmConfig)
+    config.model_config = SimpleNamespace(
+        architecture="DeepseekV41ForCausalLM",
+        hf_text_config=SimpleNamespace(engram_layer_ids=[1, 14]),
+    )
+    config.speculative_config = None
+    config.engram_config = EngramConfig(mooncake_store=True)
+    config.parallel_config = SimpleNamespace(
+        use_ubatching=False, data_parallel_size=8, enable_elastic_ep=False
+    )
+    config.load_config = LoadConfig(load_format="pt")
+    monkeypatch.setattr(
+        type(config.engram_config), "verify_model_config", lambda *a: None
+    )
+    with pytest.raises(ValueError, match="requires load_format"):
+        config._resolve_and_verify_engram_config()
