@@ -6,6 +6,7 @@ import mmap
 import tempfile
 import weakref
 from contextlib import ExitStack
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -38,7 +39,16 @@ from vllm.models.deepseek_v4_1.common.engram import (
 from vllm.utils.platform_utils import is_uva_available
 from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
+if TYPE_CHECKING:
+    from .engram_mooncake import MooncakeEngramBackend
+
 logger = init_logger(__name__)
+
+
+def _discard_external_engram_weight(
+    param: torch.nn.Parameter, loaded_weight: torch.Tensor
+) -> None:
+    """The Mooncake publisher, rather than this process, owns table weights."""
 
 
 def engram_head_shard_rank() -> int:
@@ -227,8 +237,10 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         block_size: int = 32,
         cpu_offload: bool = False,
         dp_shared_memory: bool = False,
+        mooncake_config_path: str | None = None,
     ) -> None:
         self.cpu_offload = cpu_offload
+        self.mooncake_config_path = mooncake_config_path
         self.dp_shared_memory = dp_shared_memory
         self.dp_size = get_engram_dp_size()
         if dp_shared_memory:
@@ -242,12 +254,14 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
                     "DP replicas to be co-located."
                 )
             self.dp_size = 1
-        if cpu_offload and not is_uva_available():
+        if mooncake_config_path is not None:
+            self._weight_loader = _discard_external_engram_weight
+        if cpu_offload and mooncake_config_path is None and not is_uva_available():
             raise RuntimeError("Engram CPU offload requires UVA support")
         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
         self._view_src: tuple[int, int] | None = None
         super().__init__(num_embeddings, dim, head_sizes, block_size)
-        if cpu_offload:
+        if cpu_offload and mooncake_config_path is None:
             # Constant dummy values avoid randomizing huge CPU lookup tables.
             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
             # The ue8m0 encoding of scale 1.0 is exponent byte 127.
@@ -276,6 +290,13 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
             self._shared_memory = storage
             self._weight_loader = storage.load_weight
             return storage.weight, storage.weight_scale_inv
+        if self.mooncake_config_path is not None:
+            # Keep checkpoint parameter names loadable without retaining a
+            # local copy of the externally published table.
+            return (
+                torch.empty(0, self.dim, dtype=torch.float8_e4m3fn),
+                torch.empty(0, self.dim // self.block_size, dtype=torch.uint8),
+            )
         if not self.cpu_offload:
             return super()._allocate_weights()
         # Model initialization may be inside a CUDA device context.
@@ -297,6 +318,8 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         )
 
     def _storage(self) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.mooncake_config_path is not None:
+            raise RuntimeError("Mooncake Engram rows require model-level prefetch")
         if self._shared_memory is not None:
             return self._shared_memory.get_views(self.weight, self.weight_scale_inv)
         if not self.cpu_offload:
@@ -312,6 +335,8 @@ class ParallelEngramEmbedding(BaseParallelEngramEmbedding):
         return self._views
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
+        if self.mooncake_config_path is not None:
+            raise RuntimeError("Mooncake Engram rows require model-level prefetch")
         if self.dp_size == 1:
             return super().forward(indices)
         num_tokens = indices.shape[0]
@@ -351,6 +376,7 @@ class Engram(BaseEngram):
     """NVIDIA Engram with asynchronous offload and node-local DP lookup."""
 
     _prefetch_stream: torch.cuda.Stream | None = None
+    mooncake_backend: "MooncakeEngramBackend | None" = None
 
     def _create_embedding(
         self, layout: EngramLayout, layer_hash_index: int
@@ -363,15 +389,21 @@ class Engram(BaseEngram):
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
             cpu_offload=engram_config.cpu_offload,
             dp_shared_memory=engram_config.dp_shared_memory,
+            mooncake_config_path=engram_config.mooncake_config_path,
         )
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
+        if self.embed_tokens.mooncake_config_path is not None:
+            # The model allocates one batch of Store buffers after building its layers.
+            return
         super()._init_staging(max_tokens * self.embed_tokens.dp_size, head_dim)
         if self.embed_tokens.cpu_offload:
             self._prefetch_stream = torch.cuda.Stream(device=self.staged_rows.device)
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         """Prefetch local shared rows or the DP group's gathered hash IDs."""
+        if self.mooncake_backend is not None:
+            return
         if self._prefetch_stream is None:
             return super().prepare_embeddings(hash_ids)
         rows = self.staged_rows[: hash_ids.shape[0]]
@@ -394,6 +426,11 @@ class Engram(BaseEngram):
         torch.cuda.current_stream().wait_stream(stream)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
+        if self.mooncake_backend is not None:
+            staged = self.mooncake_backend.rows(self.layer_hash_index)
+            if self.embed_tokens.dp_size > 1:
+                return _gather_engram_rows(staged, num_tokens)
+            return staged[:num_tokens]
         if self._prefetch_stream is not None:
             self._finish_prefetch(self._prefetch_stream)
         if self.embed_tokens.dp_size > 1:

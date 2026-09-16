@@ -463,6 +463,42 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             prefix=f"{prefix}.layers",
         )
 
+        self.engrams = tuple(
+            layer.engram
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+            if getattr(layer, "engram", None) is not None
+        )
+        self.engram_backend = None
+        engram_config = vllm_config.engram_config
+        if self.engrams and engram_config and engram_config.mooncake_config_path:
+            from .engram_mooncake import MooncakeEngramBackend
+
+            assert self.engram_layout is not None
+            embedding = self.engrams[0].embed_tokens
+            num_shards, shard_rank = embedding._get_shard_info()
+            self.engram_backend = MooncakeEngramBackend(
+                engram_config.mooncake_config_path,
+                num_shards,
+                shard_rank,
+                2 if vllm_config.parallel_config.enable_dbo else 1,
+                vllm_config.model_config.model,
+            )
+            for engram in self.engrams:
+                index = engram.layer_hash_index
+                self.engram_backend.attach(
+                    engram.embed_tokens,
+                    self.engram_layout.layer_ids[index],
+                    index,
+                    tuple(
+                        size
+                        for order in self.engram_layout.primes[index]
+                        for size in order
+                    ),
+                    vllm_config.scheduler_config.max_num_batched_tokens
+                    * embedding.dp_size,
+                )
+                engram.mooncake_backend = self.engram_backend
+
         # The n-gram hash needs a slot-keyed rolling store of compressed ids
         # (chunked prefill / decode lookback); key it off the first local
         # layer's sliding-window KV cache. Only PP ranks owning an engram
@@ -472,20 +508,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             vllm_config.engram_config and vllm_config.engram_config.dp_shared_memory
         )
         self.engram_swa_prefix: str | None = None
-        if self.engram_layout is not None:
-            local_engram = any(
-                isinstance(layer, DeepseekV4DecoderLayer) and layer.engram is not None
-                for layer in islice(self.layers, self.start_layer, self.end_layer)
+        if self.engram_layout is not None and self.engrams:
+            first_layer = next(
+                iter(islice(self.layers, self.start_layer, self.end_layer))
             )
-            if local_engram:
-                first_layer = next(
-                    iter(islice(self.layers, self.start_layer, self.end_layer))
-                )
-                swa_cache_module = first_layer.attn.swa_cache_layer
-                self.engram_hash = NgramHashState(
-                    vllm_config, self.engram_layout, swa_cache_module
-                )
-                self.engram_swa_prefix = swa_cache_module.prefix
+            swa_cache_module = first_layer.attn.swa_cache_layer
+            self.engram_hash = NgramHashState(
+                vllm_config, self.engram_layout, swa_cache_module
+            )
+            self.engram_swa_prefix = swa_cache_module.prefix
 
         if get_pp_group().is_last_rank:
             self.norm = RMSNorm(config.hidden_size, self.rms_norm_eps)
@@ -609,9 +640,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 gathered_hashes = gather_engram_hashes(
                     engram_hashes, dp_shared_memory=self.engram_dp_shared_memory
                 )
-                for layer in islice(self.layers, self.start_layer, self.end_layer):
-                    engram = getattr(layer, "engram", None)
-                    if engram is not None:
+                if self.engram_backend is not None:
+                    self.engram_backend.prefetch(gathered_hashes)
+                else:
+                    for engram in self.engrams:
                         engram.prepare_embeddings(
                             gathered_hashes[:, engram.layer_hash_index]
                         )

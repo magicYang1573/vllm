@@ -37,6 +37,10 @@ def model_has_engram_layers(model_config: "ModelConfig | None") -> bool:
     return bool(getattr(model_config.hf_text_config, field, None))
 
 
+def _default_mooncake_config_path() -> str | None:
+    return envs.VLLM_ENGRAM_MOONCAKE_CONFIG or None
+
+
 @config
 class EngramConfig:
     """Configuration for Engram embedding storage and sharding."""
@@ -56,10 +60,26 @@ class EngramConfig:
     memory without per-step Engram DP collectives. Requires sufficient
     /dev/shm capacity and a shared IPC namespace."""
 
+    mooncake_config_path: str | None = Field(
+        default_factory=_default_mooncake_config_path
+    )
+    """Published manifest for Engram tables served by Mooncake Store.
+
+    This placement takes precedence over cpu_offload and reads directly into CUDA.
+
+    Mooncake connection settings are read from the standard ``MOONCAKE_*``
+    environment variables. The backend batches all local Engram layers into
+    one ranged-read submission and only fetches the hash heads owned by this
+    TP/Engram-DP rank. Defaults to VLLM_ENGRAM_MOONCAKE_CONFIG."""
+
     @model_validator(mode="after")
     def _validate_shared_memory(self) -> Self:
         if self.dp_shared_memory and not self.cpu_offload:
             raise ValueError("dp_shared_memory requires cpu_offload=True")
+        if self.dp_shared_memory and self.mooncake_config_path:
+            raise ValueError(
+                "dp_shared_memory and Mooncake are alternative Engram placements"
+            )
         return self
 
     def verify_model_config(self, model_config: "ModelConfig | None") -> None:
@@ -82,6 +102,12 @@ class EngramConfig:
                 "embeddings, non-empty n-gram layer ids, and CUDA."
             )
 
+        if (
+            self.mooncake_config_path
+            and model_config.architecture != "DeepseekV41ForCausalLM"
+        ):
+            raise ValueError("Mooncake Engram only supports DeepSeek V4.1")
+
     def verify_parallel_config(self, parallel_config: "ParallelConfig") -> None:
         """Reject unsupported embedding parallel topologies."""
         if self.dp_shared_memory:
@@ -100,6 +126,22 @@ class EngramConfig:
 
     def verify_load_config(self, load_config: "LoadConfig") -> None:
         """Shared tables require a loader that invokes parameter weight callbacks."""
+        if self.mooncake_config_path:
+            if load_config.load_format not in ("safetensors", "dummy"):
+                raise ValueError(
+                    "mooncake_config_path requires load_format 'safetensors' "
+                    f"or 'dummy'; got {load_config.load_format!r}."
+                )
+            if (
+                load_config.load_format == "safetensors"
+                and load_config.safetensors_load_strategy != "lazy"
+            ):
+                raise ValueError(
+                    "mooncake_config_path requires "
+                    "safetensors_load_strategy='lazy'; automatic, eager, or "
+                    "prefetch loading may read the external Engram tables "
+                    "into local memory."
+                )
         if self.dp_shared_memory and load_config.load_format not in (
             "auto",
             "safetensors",
