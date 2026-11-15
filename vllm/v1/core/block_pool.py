@@ -277,56 +277,60 @@ class BlockPool:
             if new_hashes is not None:
                 new_hashes.append(maybe_convert_block_hash(block_hash))
 
-        if self.enable_kv_cache_events:
-            if num_cached_blocks == 0:
-                parent_block_hash: ExternalBlockHash | None = None
-            else:
-                parent_block_hash = maybe_convert_block_hash(
-                    block_hashes[num_cached_blocks - 1]
-                )
-
-            # Calculate token range for the blocks being cached
-            start_token_idx = num_cached_blocks * block_size
-            end_token_idx = num_full_blocks * block_size
-
-            # Generate extra keys for each block individually.
-            # Each block may have different extra_keys (e.g., different MM
-            # features, or cache_salt only for the first block).
-            # Skip null/masked-out blocks to match the length of new_hashes.
-            extra_keys_list: list[tuple[Any, ...] | None] = []
-            lookahead_token_ids: list[list[int]] | None = (
+        if self.enable_kv_cache_events and new_hashes:
+            # Emit contiguous BlockStored spans so `token_ids` and
+            # `parent_block_hash` match the unmasked blocks actually cached.
+            curr_mm_idx = 0
+            span_start: int | None = None
+            span_hashes: list[ExternalBlockHash] = []
+            span_extra: list[tuple[Any, ...] | None] = []
+            span_lookahead: list[list[int]] | None = (
                 [] if self.num_hash_lookahead_tokens else None
             )
-            curr_mm_idx = 0
-            for i in range(num_cached_blocks, num_full_blocks):
-                if blocks[i].is_null:
-                    continue
-                if block_mask is not None and not block_mask[i - num_cached_blocks]:
-                    continue
-                block_start = i * block_size
-                block_end = block_start + block_size
-                extra_keys, curr_mm_idx = self.generate_event_extra_keys(
-                    request, block_start, block_end, curr_mm_idx
+            for i in range(num_cached_blocks, num_full_blocks + 1):
+                is_valid = (
+                    i < num_full_blocks
+                    and not blocks[i].is_null
+                    and (block_mask is None or block_mask[i - num_cached_blocks])
                 )
-                extra_keys_list.append(extra_keys)
-                if lookahead_token_ids is not None:
-                    lookahead_token_ids.append(
-                        self.get_lookahead_token_ids(request, block_end)
+                if is_valid:
+                    if span_start is None:
+                        span_start = i
+                    block_start = i * block_size
+                    block_end = block_start + block_size
+                    span_hashes.append(maybe_convert_block_hash(block_hashes[i]))
+                    extra_keys, curr_mm_idx = self.generate_event_extra_keys(
+                        request, block_start, block_end, curr_mm_idx
                     )
-
-            self.kv_event_queue.append(
-                self._build_block_stored_event(
-                    request,
-                    block_hashes=new_hashes,
-                    parent_block_hash=parent_block_hash,
-                    start_token_idx=start_token_idx,
-                    end_token_idx=end_token_idx,
-                    block_size=block_size,
-                    kv_cache_group_id=kv_cache_group_id,
-                    extra_keys_list=extra_keys_list,
-                    lookahead_token_ids=lookahead_token_ids,
-                )
-            )
+                    span_extra.append(extra_keys)
+                    if span_lookahead is not None:
+                        span_lookahead.append(
+                            self.get_lookahead_token_ids(request, block_end)
+                        )
+                elif span_start is not None:
+                    parent_block_hash = (
+                        None
+                        if span_start == 0
+                        else maybe_convert_block_hash(block_hashes[span_start - 1])
+                    )
+                    self.kv_event_queue.append(
+                        self._build_block_stored_event(
+                            request,
+                            block_hashes=span_hashes,
+                            parent_block_hash=parent_block_hash,
+                            start_token_idx=span_start * block_size,
+                            end_token_idx=i * block_size,
+                            block_size=block_size,
+                            kv_cache_group_id=kv_cache_group_id,
+                            extra_keys_list=span_extra,
+                            lookahead_token_ids=span_lookahead,
+                        )
+                    )
+                    span_start = None
+                    span_hashes = []
+                    span_extra = []
+                    if span_lookahead is not None:
+                        span_lookahead = []
 
     def generate_event_extra_keys(
         self, request: Request, start: int, end: int, start_mm_idx: int
