@@ -867,10 +867,16 @@ class KVCacheManager:
         """
         for mgr in self.coordinator.single_type_managers:
             if mgr.records_new_block_ids:
-                assert start_token % mgr.block_size == 0
-                start_idx = start_token // mgr.block_size
+                # Ceiling-align across heterogeneous group block sizes so
+                # partially valid prefix blocks are never wiped, and skip
+                # reserved `null_block` or blocks shared with co-tenants.
+                start_idx = (start_token + mgr.block_size - 1) // mgr.block_size
                 blocks = mgr.req_to_blocks[request_id]
-                mgr.new_block_ids.extend(blk.block_id for blk in blocks[start_idx:])
+                mgr.new_block_ids.extend(
+                    blk.block_id
+                    for blk in blocks[start_idx:]
+                    if not blk.is_null and blk.ref_cnt <= 1 and blk.block_hash is None
+                )
 
     def take_kv_cache_block_copies(
         self,
