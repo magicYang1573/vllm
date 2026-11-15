@@ -879,11 +879,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                         first_group_id
                     ].pcp_world_size,
                 )
+                if _new_hit_length < curr_hit_length:
+                    # Length shrunk; invalidate previous EAGLE verifications
+                    # even when the current group also set `drop_eagle_block`.
+                    eagle_verified.clear()
                 if drop_eagle_block:
                     eagle_verified.add(idx)
-                elif _new_hit_length < curr_hit_length:
-                    # length shrunk; invalidate previous eagle verifications
-                    eagle_verified.clear()
                 curr_hit_length = _new_hit_length
                 for group_id, blocks in zip(group_ids, hit_blocks):
                     hit_blocks_by_group[group_id] = blocks
