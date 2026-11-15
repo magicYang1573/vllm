@@ -19,7 +19,7 @@ class AsyncScheduler(Scheduler):
         super()._update_after_schedule(scheduler_output)
         spec_decode_tokens = scheduler_output.scheduled_spec_decode_tokens
         # Use the latest num of scheduled draft tokens in next step as placeholder.
-        spec_token_placeholders = [-1] * scheduler_output.num_spec_tokens_to_schedule
+        num_spec_placeholders = scheduler_output.num_spec_tokens_to_schedule
         pending_structured_output_tokens = (
             scheduler_output.pending_structured_output_tokens
         )
@@ -47,7 +47,7 @@ class AsyncScheduler(Scheduler):
             )
             # Add placeholders for the new draft/spec tokens.
             # We will update the actual spec token ids in the worker process.
-            request.spec_token_ids = spec_token_placeholders
+            request.spec_token_ids = [-1] * num_spec_placeholders
 
             # Set the next step index in which this request is eligible to be
             # scheduled for decode (for PP microbatching).
