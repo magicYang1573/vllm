@@ -386,12 +386,14 @@ class EncoderDecoderCacheManager(EncoderCacheManager):
         self.num_free_slots = cache_size
         self.allocated: list[str] = []
         self.to_free: list[str] = []
+        self.request_allocated_ids: dict[str, set[int]] = {}
 
     def reset(self) -> None:
         """Reset the encoder cache to its initial state."""
         self.num_free_slots = self.cache_size
         self.allocated.clear()
         self.to_free.clear()
+        self.request_allocated_ids.clear()
 
     def check_and_update_cache(self, request: Request, input_id: int) -> bool:
         return False
@@ -413,6 +415,10 @@ class EncoderDecoderCacheManager(EncoderCacheManager):
         return num_encoder_embeds <= self.num_free_slots
 
     def allocate(self, request: Request, input_id: int) -> None:
+        alloc_ids = self.request_allocated_ids.setdefault(request.request_id, set())
+        if input_id in alloc_ids:
+            return
+        alloc_ids.add(input_id)
         num_encoder_embeds = request.get_num_encoder_embeds(input_id)
         self.num_free_slots -= num_encoder_embeds
 
@@ -420,11 +426,12 @@ class EncoderDecoderCacheManager(EncoderCacheManager):
         self.allocated.append(mm_hash)
 
     def free(self, request: Request) -> None:
-        for input_id in range(len(request.mm_features)):
+        for input_id in list(self.get_cached_input_ids(request)):
             self.free_encoder_input(request, input_id)
+        self.request_allocated_ids.pop(request.request_id, None)
 
     def get_cached_input_ids(self, request: Request) -> set[int]:
-        return set(range(len(request.mm_features)))
+        return set(self.request_allocated_ids.get(request.request_id, ()))
 
     def get_freed_mm_hashes(self) -> list[str]:
         # As encoder cache is not used for enc-dec models, we can free the entries here
@@ -437,5 +444,11 @@ class EncoderDecoderCacheManager(EncoderCacheManager):
         return to_free
 
     def free_encoder_input(self, request: Request, input_id: int) -> None:
+        alloc_ids = self.request_allocated_ids.get(request.request_id)
+        if not alloc_ids or input_id not in alloc_ids:
+            return
+        alloc_ids.discard(input_id)
+        if not alloc_ids:
+            self.request_allocated_ids.pop(request.request_id, None)
         num_encoder_embeds = request.get_num_encoder_embeds(input_id)
         self.num_free_slots += num_encoder_embeds
